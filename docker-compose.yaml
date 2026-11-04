@@ -1,0 +1,52 @@
+services:
+  governance-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: databricks-governance-service
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - ENVIRONMENT=local
+      - LOG_LEVEL=debug
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/governance?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - governance-net
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: databricks-governance-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=governance
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d governance"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - governance-net
+
+networks:
+  governance-net:
+    driver: bridge
+
+volumes:
+  postgres_data:

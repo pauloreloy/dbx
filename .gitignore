@@ -1,0 +1,28 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go test / coverage
+*.out
+*.test
+
+# Environment & Python
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.venv/
+.venv
+.DS_Store
+Thumbs.db
+.pytest_cache
+.pytest_cache/

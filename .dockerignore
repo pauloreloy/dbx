@@ -1,0 +1,12 @@
+.git
+.github
+.venv
+bin/
+*.out
+*.test
+.DS_Store
+.idea
+.vscode
+Dockerfile*
+docker-compose*
+README.md

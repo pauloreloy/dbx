@@ -1,0 +1,4231 @@
+openapi: 3.1.0
+info:
+  title: Databricks Governance Service
+  version: 0.1.0
+  summary: Governança de acessos e gestão de catálogo sobre o Databricks.
+  description: |
+    Microserviço interno de governança de dados sobre o Databricks (Unity Catalog).
+    Expõe uma API de domínio, não um proxy 1:1 da API do Databricks.
+
+    ## Multi-workspace
+    Todas as rotas de recurso ficam sob `/v1/workspaces/{ws}`. `{ws}` é um **alias do registry** do
+    serviço (resolvido para host e credenciais OAuth M2M, uma por workspace), e não o ID numérico do
+    Databricks. Atenção: o Unity Catalog é **por metastore**, não por workspace. Dois workspaces ligados
+    ao mesmo metastore enxergam os mesmos objetos, e um grant feito via `ws-a` vale também em `ws-b`.
+    Por isso a auditoria registra `workspace` e `metastore_id`, e a rota de auditoria é global.
+
+    ## Convenções
+    - **Escritas** exigem `X-Change-Ref` (ticket/change) e geram evento de auditoria.
+    - **Idempotência**: `Idempotency-Key` (obrigatório em criações, opcional em grant/revoke).
+    - **Erros**: RFC 9457 (`application/problem+json`).
+    - **Paginação**: `page_size` e `page_token` / `next_page_token`.
+    - **Correlação**: `X-Request-Id` é aceito, gerado se ausente, devolvido e propagado ao Databricks.
+    - **Autorização**: além do JWT/mTLS, o serviço aplica política própria (quem pode conceder o quê, em
+      qual catálogo), independente das permissões do service principal no Databricks.
+
+    ## Fora do escopo desta versão
+    Criação de tabelas/views (exige SQL assíncrono e `/operations`), `grants/batch|plan|sync`,
+    external locations, storage credentials, ABAC e gestão de grupos.
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+servers:
+- url: https://databricks-governance.internal.example.com
+  description: Substituir pelo host interno real.
+security:
+- bearerAuth: []
+- mutualTLS: []
+tags:
+- name: Workspaces
+  description: Registry de workspaces (somente leitura).
+- name: Grants
+  description: Leitura, concessão e revogação de privilégios.
+- name: Principals
+  description: Consulta de identidades (somente leitura).
+- name: Catalogs
+- name: Schemas
+- name: Tables
+- name: Views
+- name: Volumes
+- name: Ownership
+  description: Propriedade de objetos.
+- name: Tags
+  description: Tags de objetos.
+- name: Audit
+  description: Trilha de auditoria do serviço.
+- name: Operational
+  description: Health checks (sem autenticação).
+paths:
+  /v1/workspaces:
+    get:
+      operationId: listWorkspaces
+      summary: Lista os workspaces registrados
+      tags:
+      - Workspaces
+      description: Retorna apenas os workspaces que o chamador tem permissão de usar neste serviço.
+      parameters:
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v1/workspaces/{ws}:
+    get:
+      operationId: getWorkspace
+      summary: Detalha um workspace registrado
+      tags:
+      - Workspaces
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workspace'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v1/workspaces/{ws}/principals:
+    get:
+      operationId: listPrincipals
+      summary: Busca principals (usuários, grupos e service principals)
+      tags:
+      - Principals
+      description: Somente leitura. Usado pelos consumidores para validar a existência de um principal antes de
+        conceder privilégios. As identidades são gerenciadas no IdP (SCIM); este serviço não as altera.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/PrincipalTypeParam'
+      - $ref: '#/components/parameters/SearchQueryParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrincipalList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/audit/events:
+    get:
+      operationId: listAuditEvents
+      summary: Lista eventos de auditoria
+      tags:
+      - Audit
+      description: 'A auditoria é do serviço e atravessa todos os workspaces; por isso não fica sob `/workspaces/{ws}`.
+        Use o filtro `workspace`. Ordenação: mais recentes primeiro.'
+      parameters:
+      - name: workspace
+        in: query
+        description: Filtra por alias de workspace.
+        schema:
+          type: string
+      - name: actor
+        in: query
+        description: Subject (sub) do chamador que executou a ação.
+        schema:
+          type: string
+      - name: action
+        in: query
+        schema:
+          $ref: '#/components/schemas/AuditAction'
+      - name: securable_type
+        in: query
+        schema:
+          $ref: '#/components/schemas/SecurableType'
+      - name: securable_name
+        in: query
+        description: 'Nome completo do objeto (ex.: prod.vendas.pedidos).'
+        schema:
+          type: string
+      - name: principal
+        in: query
+        description: Principal-alvo de um grant/revoke.
+        schema:
+          type: string
+      - name: change_ref
+        in: query
+        description: 'Valor de X-Change-Ref (ex.: ticket).'
+        schema:
+          type: string
+      - name: outcome
+        in: query
+        schema:
+          $ref: '#/components/schemas/AuditOutcome'
+      - name: from
+        in: query
+        description: Início do intervalo (inclusivo).
+        schema:
+          type: string
+          format: date-time
+      - name: to
+        in: query
+        description: Fim do intervalo (exclusivo).
+        schema:
+          type: string
+          format: date-time
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEventList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v1/audit/events/{event_id}:
+    get:
+      operationId: getAuditEvent
+      summary: Detalha um evento de auditoria (inclui estado anterior e posterior)
+      tags:
+      - Audit
+      parameters:
+      - name: event_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEvent'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /healthz:
+    get:
+      operationId: getLiveness
+      summary: Liveness
+      tags:
+      - Operational
+      security: []
+      responses:
+        '200':
+          description: Processo ativo.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /readyz:
+    get:
+      operationId: getReadiness
+      summary: Readiness (Postgres, Vault e registry carregados)
+      tags:
+      - Operational
+      security: []
+      responses:
+        '200':
+          description: Pronto para receber tráfego.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: Dependência indisponível.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /v1/workspaces/{ws}/catalogs:
+    get:
+      operationId: listCatalogs
+      summary: Lista catalogs
+      tags:
+      - Catalogs
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      operationId: createCatalog
+      summary: Cria catalog
+      tags:
+      - Catalogs
+      description: Execução síncrona. `Idempotency-Key` é obrigatório (DDL não é naturalmente idempotente).
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyRequiredHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CatalogCreate'
+      responses:
+        '201':
+          description: Criado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Location:
+              description: URL do recurso criado.
+              schema:
+                type: string
+                format: uri-reference
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Catalog'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}:
+    get:
+      operationId: getCatalog
+      summary: Detalha catalog
+      tags:
+      - Catalogs
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Catalog'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    patch:
+      operationId: updateCatalog
+      summary: Atualiza catalog (comentário, propriedades, renomeação)
+      tags:
+      - Catalogs
+      description: Merge parcial; ao menos um campo é obrigatório. A troca de dono usa `PUT .../owner`.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CatalogUpdate'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Catalog'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+    delete:
+      operationId: deleteCatalog
+      summary: Remove catalog
+      tags:
+      - Catalogs
+      description: '`confirm` deve ser igual ao nome completo do objeto, caso contrário 422 `confirmation-mismatch`.
+        Objetos da lista de protegidos retornam 403 `protected-resource`. Com `force=false` (padrão), a remoção
+        falha se o objeto não estiver vazio.'
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/ConfirmParam'
+      - $ref: '#/components/parameters/ForceParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '204':
+          description: Removido com sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/grants:
+    get:
+      operationId: listCatalogGrants
+      summary: Lista os grants diretos de catalog
+      tags:
+      - Grants
+      description: Somente privilégios concedidos diretamente neste objeto (sem herança).
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/PrincipalFilterParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/workspaces/{ws}/catalogs/{catalog}/grants/grant:
+    post:
+      operationId: grantOnCatalog
+      summary: Concede privilégios sobre catalog
+      tags:
+      - Grants
+      description: |-
+        Fluxo: (1) valida o corpo e a matriz de privilégios por tipo de objeto (422 `privilege-not-applicable`); (2) confirma que cada principal existe (422 `principal-not-found`); (3) aplica a política de autorização do serviço; (4) rejeita mudanças que removeriam privilégios de principals protegidos do workspace (409 `protected-principal`); (5) executa no Databricks; (6) grava o evento de auditoria. A operação é idempotente: repetir o mesmo corpo não gera erro e retorna `changed: false`.
+
+        `X-Change-Ref` é obrigatório e vai para a auditoria. `Idempotency-Key` é opcional.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GrantChangeRequest'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantChangeResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/grants/revoke:
+    post:
+      operationId: revokeOnCatalog
+      summary: Revoga privilégios sobre catalog
+      tags:
+      - Grants
+      description: |-
+        Fluxo: (1) valida o corpo e a matriz de privilégios por tipo de objeto (422 `privilege-not-applicable`); (2) confirma que cada principal existe (422 `principal-not-found`); (3) aplica a política de autorização do serviço; (4) rejeita mudanças que removeriam privilégios de principals protegidos do workspace (409 `protected-principal`); (5) executa no Databricks; (6) grava o evento de auditoria. A operação é idempotente: repetir o mesmo corpo não gera erro e retorna `changed: false`.
+
+        `X-Change-Ref` é obrigatório e vai para a auditoria. `Idempotency-Key` é opcional.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GrantChangeRequest'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantChangeResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/effective-grants:
+    get:
+      operationId: listCatalogEffectiveGrants
+      summary: Lista os grants efetivos (incluindo herdados) de catalog
+      tags:
+      - Grants
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/PrincipalFilterParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EffectiveGrantList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/workspaces/{ws}/catalogs/{catalog}/owner:
+    put:
+      operationId: setCatalogOwner
+      summary: Transfere a propriedade de catalog
+      tags:
+      - Ownership
+      description: Idempotente. O novo dono deve existir no workspace (422 `principal-not-found`).
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OwnerUpdate'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Owner'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/tags:
+    get:
+      operationId: listCatalogTags
+      summary: Lista as tags de catalog
+      tags:
+      - Tags
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TagList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/workspaces/{ws}/catalogs/{catalog}/tags/{tag_key}:
+    put:
+      operationId: setCatalogTag
+      summary: Cria ou atualiza uma tag de catalog
+      tags:
+      - Tags
+      description: Tags governadas exigem, no Databricks, permissão ASSIGN ou MANAGE na tag policy; a falta dela
+        retorna 403.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/TagKeyParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TagValue'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TagAssignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+    delete:
+      operationId: deleteCatalogTag
+      summary: Remove uma tag de catalog
+      tags:
+      - Tags
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/TagKeyParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '204':
+          description: Removido com sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas:
+    get:
+      operationId: listSchemas
+      summary: Lista schemas
+      tags:
+      - Schemas
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataSchemaList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      operationId: createSchema
+      summary: Cria schema
+      tags:
+      - Schemas
+      description: Execução síncrona. `Idempotency-Key` é obrigatório (DDL não é naturalmente idempotente).
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyRequiredHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DataSchemaCreate'
+      responses:
+        '201':
+          description: Criado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Location:
+              description: URL do recurso criado.
+              schema:
+                type: string
+                format: uri-reference
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataSchema'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}:
+    get:
+      operationId: getSchema
+      summary: Detalha schema
+      tags:
+      - Schemas
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataSchema'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    patch:
+      operationId: updateSchema
+      summary: Atualiza schema (comentário, propriedades, renomeação)
+      tags:
+      - Schemas
+      description: Merge parcial; ao menos um campo é obrigatório. A troca de dono usa `PUT .../owner`.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DataSchemaUpdate'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataSchema'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+    delete:
+      operationId: deleteSchema
+      summary: Remove schema
+      tags:
+      - Schemas
+      description: '`confirm` deve ser igual ao nome completo do objeto, caso contrário 422 `confirmation-mismatch`.
+        Objetos da lista de protegidos retornam 403 `protected-resource`. Com `force=false` (padrão), a remoção
+        falha se o objeto não estiver vazio.'
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/ConfirmParam'
+      - $ref: '#/components/parameters/ForceParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '204':
+          description: Removido com sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/grants:
+    get:
+      operationId: listSchemaGrants
+      summary: Lista os grants diretos de schema
+      tags:
+      - Grants
+      description: Somente privilégios concedidos diretamente neste objeto (sem herança).
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/PrincipalFilterParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/grants/grant:
+    post:
+      operationId: grantOnSchema
+      summary: Concede privilégios sobre schema
+      tags:
+      - Grants
+      description: |-
+        Fluxo: (1) valida o corpo e a matriz de privilégios por tipo de objeto (422 `privilege-not-applicable`); (2) confirma que cada principal existe (422 `principal-not-found`); (3) aplica a política de autorização do serviço; (4) rejeita mudanças que removeriam privilégios de principals protegidos do workspace (409 `protected-principal`); (5) executa no Databricks; (6) grava o evento de auditoria. A operação é idempotente: repetir o mesmo corpo não gera erro e retorna `changed: false`.
+
+        `X-Change-Ref` é obrigatório e vai para a auditoria. `Idempotency-Key` é opcional.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GrantChangeRequest'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantChangeResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/grants/revoke:
+    post:
+      operationId: revokeOnSchema
+      summary: Revoga privilégios sobre schema
+      tags:
+      - Grants
+      description: |-
+        Fluxo: (1) valida o corpo e a matriz de privilégios por tipo de objeto (422 `privilege-not-applicable`); (2) confirma que cada principal existe (422 `principal-not-found`); (3) aplica a política de autorização do serviço; (4) rejeita mudanças que removeriam privilégios de principals protegidos do workspace (409 `protected-principal`); (5) executa no Databricks; (6) grava o evento de auditoria. A operação é idempotente: repetir o mesmo corpo não gera erro e retorna `changed: false`.
+
+        `X-Change-Ref` é obrigatório e vai para a auditoria. `Idempotency-Key` é opcional.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GrantChangeRequest'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantChangeResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/effective-grants:
+    get:
+      operationId: listSchemaEffectiveGrants
+      summary: Lista os grants efetivos (incluindo herdados) de schema
+      tags:
+      - Grants
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/PrincipalFilterParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EffectiveGrantList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/owner:
+    put:
+      operationId: setSchemaOwner
+      summary: Transfere a propriedade de schema
+      tags:
+      - Ownership
+      description: Idempotente. O novo dono deve existir no workspace (422 `principal-not-found`).
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OwnerUpdate'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Owner'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/tags:
+    get:
+      operationId: listSchemaTags
+      summary: Lista as tags de schema
+      tags:
+      - Tags
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TagList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/tags/{tag_key}:
+    put:
+      operationId: setSchemaTag
+      summary: Cria ou atualiza uma tag de schema
+      tags:
+      - Tags
+      description: Tags governadas exigem, no Databricks, permissão ASSIGN ou MANAGE na tag policy; a falta dela
+        retorna 403.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/TagKeyParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TagValue'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TagAssignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+    delete:
+      operationId: deleteSchemaTag
+      summary: Remove uma tag de schema
+      tags:
+      - Tags
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/TagKeyParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '204':
+          description: Removido com sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/tables:
+    get:
+      operationId: listTables
+      summary: Lista tables
+      tags:
+      - Tables
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/tables/{table}:
+    get:
+      operationId: getTable
+      summary: Detalha table
+      tags:
+      - Tables
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/TableParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Table'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    delete:
+      operationId: deleteTable
+      summary: Remove table
+      tags:
+      - Tables
+      description: '`confirm` deve ser igual ao nome completo do objeto, caso contrário 422 `confirmation-mismatch`.
+        Objetos da lista de protegidos retornam 403 `protected-resource`.'
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/TableParam'
+      - $ref: '#/components/parameters/ConfirmParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '204':
+          description: Removido com sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/tables/{table}/grants:
+    get:
+      operationId: listTableGrants
+      summary: Lista os grants diretos de table
+      tags:
+      - Grants
+      description: Somente privilégios concedidos diretamente neste objeto (sem herança).
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/TableParam'
+      - $ref: '#/components/parameters/PrincipalFilterParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/tables/{table}/grants/grant:
+    post:
+      operationId: grantOnTable
+      summary: Concede privilégios sobre table
+      tags:
+      - Grants
+      description: |-
+        Fluxo: (1) valida o corpo e a matriz de privilégios por tipo de objeto (422 `privilege-not-applicable`); (2) confirma que cada principal existe (422 `principal-not-found`); (3) aplica a política de autorização do serviço; (4) rejeita mudanças que removeriam privilégios de principals protegidos do workspace (409 `protected-principal`); (5) executa no Databricks; (6) grava o evento de auditoria. A operação é idempotente: repetir o mesmo corpo não gera erro e retorna `changed: false`.
+
+        `X-Change-Ref` é obrigatório e vai para a auditoria. `Idempotency-Key` é opcional.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/TableParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GrantChangeRequest'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantChangeResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/tables/{table}/grants/revoke:
+    post:
+      operationId: revokeOnTable
+      summary: Revoga privilégios sobre table
+      tags:
+      - Grants
+      description: |-
+        Fluxo: (1) valida o corpo e a matriz de privilégios por tipo de objeto (422 `privilege-not-applicable`); (2) confirma que cada principal existe (422 `principal-not-found`); (3) aplica a política de autorização do serviço; (4) rejeita mudanças que removeriam privilégios de principals protegidos do workspace (409 `protected-principal`); (5) executa no Databricks; (6) grava o evento de auditoria. A operação é idempotente: repetir o mesmo corpo não gera erro e retorna `changed: false`.
+
+        `X-Change-Ref` é obrigatório e vai para a auditoria. `Idempotency-Key` é opcional.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/TableParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GrantChangeRequest'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantChangeResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/tables/{table}/effective-grants:
+    get:
+      operationId: listTableEffectiveGrants
+      summary: Lista os grants efetivos (incluindo herdados) de table
+      tags:
+      - Grants
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/TableParam'
+      - $ref: '#/components/parameters/PrincipalFilterParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EffectiveGrantList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/tables/{table}/owner:
+    put:
+      operationId: setTableOwner
+      summary: Transfere a propriedade de table
+      tags:
+      - Ownership
+      description: Idempotente. O novo dono deve existir no workspace (422 `principal-not-found`).
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/TableParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OwnerUpdate'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Owner'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/tables/{table}/tags:
+    get:
+      operationId: listTableTags
+      summary: Lista as tags de table
+      tags:
+      - Tags
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/TableParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TagList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/tables/{table}/tags/{tag_key}:
+    put:
+      operationId: setTableTag
+      summary: Cria ou atualiza uma tag de table
+      tags:
+      - Tags
+      description: Tags governadas exigem, no Databricks, permissão ASSIGN ou MANAGE na tag policy; a falta dela
+        retorna 403.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/TableParam'
+      - $ref: '#/components/parameters/TagKeyParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TagValue'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TagAssignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+    delete:
+      operationId: deleteTableTag
+      summary: Remove uma tag de table
+      tags:
+      - Tags
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/TableParam'
+      - $ref: '#/components/parameters/TagKeyParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '204':
+          description: Removido com sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/views:
+    get:
+      operationId: listViews
+      summary: Lista views
+      tags:
+      - Views
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ViewList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/views/{view}:
+    get:
+      operationId: getView
+      summary: Detalha view
+      tags:
+      - Views
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/ViewParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/View'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    delete:
+      operationId: deleteView
+      summary: Remove view
+      tags:
+      - Views
+      description: '`confirm` deve ser igual ao nome completo do objeto, caso contrário 422 `confirmation-mismatch`.
+        Objetos da lista de protegidos retornam 403 `protected-resource`.'
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/ViewParam'
+      - $ref: '#/components/parameters/ConfirmParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '204':
+          description: Removido com sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/views/{view}/grants:
+    get:
+      operationId: listViewGrants
+      summary: Lista os grants diretos de view
+      tags:
+      - Grants
+      description: Somente privilégios concedidos diretamente neste objeto (sem herança).
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/ViewParam'
+      - $ref: '#/components/parameters/PrincipalFilterParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/views/{view}/grants/grant:
+    post:
+      operationId: grantOnView
+      summary: Concede privilégios sobre view
+      tags:
+      - Grants
+      description: |-
+        Fluxo: (1) valida o corpo e a matriz de privilégios por tipo de objeto (422 `privilege-not-applicable`); (2) confirma que cada principal existe (422 `principal-not-found`); (3) aplica a política de autorização do serviço; (4) rejeita mudanças que removeriam privilégios de principals protegidos do workspace (409 `protected-principal`); (5) executa no Databricks; (6) grava o evento de auditoria. A operação é idempotente: repetir o mesmo corpo não gera erro e retorna `changed: false`.
+
+        `X-Change-Ref` é obrigatório e vai para a auditoria. `Idempotency-Key` é opcional.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/ViewParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GrantChangeRequest'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantChangeResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/views/{view}/grants/revoke:
+    post:
+      operationId: revokeOnView
+      summary: Revoga privilégios sobre view
+      tags:
+      - Grants
+      description: |-
+        Fluxo: (1) valida o corpo e a matriz de privilégios por tipo de objeto (422 `privilege-not-applicable`); (2) confirma que cada principal existe (422 `principal-not-found`); (3) aplica a política de autorização do serviço; (4) rejeita mudanças que removeriam privilégios de principals protegidos do workspace (409 `protected-principal`); (5) executa no Databricks; (6) grava o evento de auditoria. A operação é idempotente: repetir o mesmo corpo não gera erro e retorna `changed: false`.
+
+        `X-Change-Ref` é obrigatório e vai para a auditoria. `Idempotency-Key` é opcional.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/ViewParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GrantChangeRequest'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantChangeResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/views/{view}/effective-grants:
+    get:
+      operationId: listViewEffectiveGrants
+      summary: Lista os grants efetivos (incluindo herdados) de view
+      tags:
+      - Grants
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/ViewParam'
+      - $ref: '#/components/parameters/PrincipalFilterParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EffectiveGrantList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/views/{view}/owner:
+    put:
+      operationId: setViewOwner
+      summary: Transfere a propriedade de view
+      tags:
+      - Ownership
+      description: Idempotente. O novo dono deve existir no workspace (422 `principal-not-found`).
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/ViewParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OwnerUpdate'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Owner'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/views/{view}/tags:
+    get:
+      operationId: listViewTags
+      summary: Lista as tags de view
+      tags:
+      - Tags
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/ViewParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TagList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/views/{view}/tags/{tag_key}:
+    put:
+      operationId: setViewTag
+      summary: Cria ou atualiza uma tag de view
+      tags:
+      - Tags
+      description: Tags governadas exigem, no Databricks, permissão ASSIGN ou MANAGE na tag policy; a falta dela
+        retorna 403.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/ViewParam'
+      - $ref: '#/components/parameters/TagKeyParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TagValue'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TagAssignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+    delete:
+      operationId: deleteViewTag
+      summary: Remove uma tag de view
+      tags:
+      - Tags
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/ViewParam'
+      - $ref: '#/components/parameters/TagKeyParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '204':
+          description: Removido com sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/volumes:
+    get:
+      operationId: listVolumes
+      summary: Lista volumes
+      tags:
+      - Volumes
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VolumeList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      operationId: createVolume
+      summary: Cria volume
+      tags:
+      - Volumes
+      description: Execução síncrona. `Idempotency-Key` é obrigatório (DDL não é naturalmente idempotente). Volumes
+        EXTERNAL exigem `storage_location` em uma external location acessível.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyRequiredHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VolumeCreate'
+      responses:
+        '201':
+          description: Criado.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            Location:
+              description: URL do recurso criado.
+              schema:
+                type: string
+                format: uri-reference
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Volume'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/volumes/{volume}:
+    get:
+      operationId: getVolume
+      summary: Detalha volume
+      tags:
+      - Volumes
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/VolumeParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Volume'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    patch:
+      operationId: updateVolume
+      summary: Atualiza volume (comentário, propriedades, renomeação)
+      tags:
+      - Volumes
+      description: Merge parcial; ao menos um campo é obrigatório. A troca de dono usa `PUT .../owner`.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/VolumeParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VolumeUpdate'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Volume'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+    delete:
+      operationId: deleteVolume
+      summary: Remove volume
+      tags:
+      - Volumes
+      description: '`confirm` deve ser igual ao nome completo do objeto, caso contrário 422 `confirmation-mismatch`.
+        Objetos da lista de protegidos retornam 403 `protected-resource`.'
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/VolumeParam'
+      - $ref: '#/components/parameters/ConfirmParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '204':
+          description: Removido com sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/volumes/{volume}/grants:
+    get:
+      operationId: listVolumeGrants
+      summary: Lista os grants diretos de volume
+      tags:
+      - Grants
+      description: Somente privilégios concedidos diretamente neste objeto (sem herança).
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/VolumeParam'
+      - $ref: '#/components/parameters/PrincipalFilterParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/volumes/{volume}/grants/grant:
+    post:
+      operationId: grantOnVolume
+      summary: Concede privilégios sobre volume
+      tags:
+      - Grants
+      description: |-
+        Fluxo: (1) valida o corpo e a matriz de privilégios por tipo de objeto (422 `privilege-not-applicable`); (2) confirma que cada principal existe (422 `principal-not-found`); (3) aplica a política de autorização do serviço; (4) rejeita mudanças que removeriam privilégios de principals protegidos do workspace (409 `protected-principal`); (5) executa no Databricks; (6) grava o evento de auditoria. A operação é idempotente: repetir o mesmo corpo não gera erro e retorna `changed: false`.
+
+        `X-Change-Ref` é obrigatório e vai para a auditoria. `Idempotency-Key` é opcional.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/VolumeParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GrantChangeRequest'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantChangeResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/volumes/{volume}/grants/revoke:
+    post:
+      operationId: revokeOnVolume
+      summary: Revoga privilégios sobre volume
+      tags:
+      - Grants
+      description: |-
+        Fluxo: (1) valida o corpo e a matriz de privilégios por tipo de objeto (422 `privilege-not-applicable`); (2) confirma que cada principal existe (422 `principal-not-found`); (3) aplica a política de autorização do serviço; (4) rejeita mudanças que removeriam privilégios de principals protegidos do workspace (409 `protected-principal`); (5) executa no Databricks; (6) grava o evento de auditoria. A operação é idempotente: repetir o mesmo corpo não gera erro e retorna `changed: false`.
+
+        `X-Change-Ref` é obrigatório e vai para a auditoria. `Idempotency-Key` é opcional.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/VolumeParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GrantChangeRequest'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GrantChangeResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/volumes/{volume}/effective-grants:
+    get:
+      operationId: listVolumeEffectiveGrants
+      summary: Lista os grants efetivos (incluindo herdados) de volume
+      tags:
+      - Grants
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/VolumeParam'
+      - $ref: '#/components/parameters/PrincipalFilterParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EffectiveGrantList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/volumes/{volume}/owner:
+    put:
+      operationId: setVolumeOwner
+      summary: Transfere a propriedade de volume
+      tags:
+      - Ownership
+      description: Idempotente. O novo dono deve existir no workspace (422 `principal-not-found`).
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/VolumeParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OwnerUpdate'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Owner'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/volumes/{volume}/tags:
+    get:
+      operationId: listVolumeTags
+      summary: Lista as tags de volume
+      tags:
+      - Tags
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/VolumeParam'
+      - $ref: '#/components/parameters/PageSizeParam'
+      - $ref: '#/components/parameters/PageTokenParam'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TagList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/workspaces/{ws}/catalogs/{catalog}/schemas/{schema}/volumes/{volume}/tags/{tag_key}:
+    put:
+      operationId: setVolumeTag
+      summary: Cria ou atualiza uma tag de volume
+      tags:
+      - Tags
+      description: Tags governadas exigem, no Databricks, permissão ASSIGN ou MANAGE na tag policy; a falta dela
+        retorna 403.
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/VolumeParam'
+      - $ref: '#/components/parameters/TagKeyParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TagValue'
+      responses:
+        '200':
+          description: Sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TagAssignment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+    delete:
+      operationId: deleteVolumeTag
+      summary: Remove uma tag de volume
+      tags:
+      - Tags
+      parameters:
+      - $ref: '#/components/parameters/WorkspaceParam'
+      - $ref: '#/components/parameters/CatalogParam'
+      - $ref: '#/components/parameters/SchemaParam'
+      - $ref: '#/components/parameters/VolumeParam'
+      - $ref: '#/components/parameters/TagKeyParam'
+      - $ref: '#/components/parameters/ChangeRefHeader'
+      - $ref: '#/components/parameters/RequestIdHeader'
+      responses:
+        '204':
+          description: Removido com sucesso.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT emitido pelo IdP corporativo (OIDC) para a identidade do serviço chamador.
+    mutualTLS:
+      type: mutualTLS
+      description: Certificado de cliente emitido pela CA interna.
+  parameters:
+    WorkspaceParam:
+      name: ws
+      in: path
+      required: true
+      description: Alias do workspace no registry do serviço (não é o ID numérico do Databricks).
+      schema:
+        type: string
+        pattern: ^[a-z0-9][a-z0-9-]{1,62}$
+        examples:
+        - prod-br
+    TagKeyParam:
+      name: tag_key
+      in: path
+      required: true
+      description: 'Chave da tag. Restrita a letras, dígitos e `_ . : @ = + -`.'
+      schema:
+        type: string
+        pattern: ^[A-Za-z0-9_.:@=+-]{1,255}$
+    PageSizeParam:
+      name: page_size
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    PageTokenParam:
+      name: page_token
+      in: query
+      description: Token opaco retornado em `next_page_token`.
+      schema:
+        type: string
+    PrincipalFilterParam:
+      name: principal
+      in: query
+      description: Retorna apenas os privilégios deste principal.
+      schema:
+        type: string
+    PrincipalTypeParam:
+      name: type
+      in: query
+      schema:
+        $ref: '#/components/schemas/PrincipalType'
+    SearchQueryParam:
+      name: q
+      in: query
+      description: Busca por prefixo (mínimo 2 caracteres).
+      schema:
+        type: string
+        minLength: 2
+        maxLength: 128
+    ConfirmParam:
+      name: confirm
+      in: query
+      required: true
+      description: Deve ser igual ao nome completo do objeto a remover.
+      schema:
+        type: string
+    ForceParam:
+      name: force
+      in: query
+      description: Remove mesmo se o objeto não estiver vazio (cascata). Use com cuidado.
+      schema:
+        type: boolean
+        default: false
+    RequestIdHeader:
+      name: X-Request-Id
+      in: header
+      description: ID de correlação. Se ausente, o serviço gera um. É propagado às chamadas ao Databricks.
+      schema:
+        type: string
+        maxLength: 128
+    ChangeRefHeader:
+      name: X-Change-Ref
+      in: header
+      required: true
+      description: Referência da mudança (ticket, change request). Obrigatória em toda escrita; vai para a auditoria.
+      schema:
+        type: string
+        minLength: 3
+        maxLength: 128
+      example: TICKET-1234
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      description: 'Chave de idempotência (escopo: workspace + chamador + chave). Retenção de 24 h.'
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+    IdempotencyKeyRequiredHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: 'Chave de idempotência (escopo: workspace + chamador + chave). Retenção de 24 h. Reutilizar a
+        chave com corpo diferente retorna 409 `idempotency-conflict`.'
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+    CatalogParam:
+      name: catalog
+      in: path
+      required: true
+      description: Nome do objeto (catalog). Sem pontos, barras ou espaços.
+      schema:
+        type: string
+        pattern: ^[^./\s]{1,255}$
+    SchemaParam:
+      name: schema
+      in: path
+      required: true
+      description: Nome do objeto (schema). Sem pontos, barras ou espaços.
+      schema:
+        type: string
+        pattern: ^[^./\s]{1,255}$
+    TableParam:
+      name: table
+      in: path
+      required: true
+      description: Nome do objeto (table). Sem pontos, barras ou espaços.
+      schema:
+        type: string
+        pattern: ^[^./\s]{1,255}$
+    ViewParam:
+      name: view
+      in: path
+      required: true
+      description: Nome do objeto (view). Sem pontos, barras ou espaços.
+      schema:
+        type: string
+        pattern: ^[^./\s]{1,255}$
+    VolumeParam:
+      name: volume
+      in: path
+      required: true
+      description: Nome do objeto (volume). Sem pontos, barras ou espaços.
+      schema:
+        type: string
+        pattern: ^[^./\s]{1,255}$
+  headers:
+    XRequestId:
+      description: ID de correlação da requisição.
+      schema:
+        type: string
+    RetryAfter:
+      description: Segundos até a próxima tentativa.
+      schema:
+        type: integer
+        minimum: 0
+  responses:
+    BadRequest:
+      description: Requisição malformada (JSON inválido, parâmetro fora do formato).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Credencial ausente ou inválida.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: A política do serviço (ou o Databricks) nega a operação. Inclui `protected-resource`.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Workspace, objeto ou principal-alvo inexistente.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: 'Conflito: objeto já existe, `protected-principal`, `idempotency-conflict` ou catálogo não vinculado
+        ao workspace.'
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnprocessableEntity:
+      description: 'Regra de domínio violada: `privilege-not-applicable`, `principal-not-found`, `confirmation-mismatch`,
+        `validation-failed`.'
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: Limite de taxa (do serviço ou do Databricks). Respeite `Retry-After`.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    InternalError:
+      description: Erro interno do serviço.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    BadGateway:
+      description: Erro retornado pelo Databricks que não mapeia para um status específico. Veja `upstream`.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: Databricks, Vault ou Postgres indisponível.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Problem:
+      type: object
+      required:
+      - type
+      - title
+      - status
+      description: RFC 9457 (`application/problem+json`).
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          description: 'Identificador do problema, ex.: `/problems/privilege-not-applicable`.'
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri-reference
+        request_id:
+          type: string
+        workspace:
+          type: string
+        retry_after_seconds:
+          type: integer
+          minimum: 0
+        errors:
+          type: array
+          description: Erros de validação por campo.
+          items:
+            type: object
+            required:
+            - field
+            - message
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+              code:
+                type: string
+        upstream:
+          type: object
+          description: Erro original do Databricks, quando houver.
+          properties:
+            error_code:
+              type: string
+              examples:
+              - PERMISSION_DENIED
+            message:
+              type: string
+            http_status:
+              type: integer
+      examples:
+      - type: /problems/privilege-not-applicable
+        title: Privilégio não aplicável
+        status: 422
+        detail: USE_SCHEMA não se aplica a TABLE.
+        request_id: req_01J9Z
+        workspace: prod-br
+        errors:
+        - field: changes[0].privileges[1]
+          message: USE_SCHEMA não se aplica a TABLE
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+          - ok
+          - degraded
+          - down
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+    SecurableType:
+      type: string
+      enum:
+      - CATALOG
+      - SCHEMA
+      - TABLE
+      - VIEW
+      - VOLUME
+    SecurableRef:
+      type: object
+      required:
+      - type
+      - name
+      properties:
+        type:
+          $ref: '#/components/schemas/SecurableType'
+        name:
+          type: string
+          description: Nome completo (catalog.schema.objeto).
+          examples:
+          - prod.vendas.pedidos
+        metastore_id:
+          type: string
+          description: 'O metastore é compartilhado entre workspaces: o mesmo objeto pode ser alcançado por mais
+            de um `ws`.'
+    Privilege:
+      type: string
+      description: Allowlist de privilégios aceitos pelo serviço. A matriz de aplicabilidade por tipo de objeto
+        é validada no servidor (422 `privilege-not-applicable`).
+      enum:
+      - ALL_PRIVILEGES
+      - APPLY_TAG
+      - BROWSE
+      - CREATE_CONNECTION
+      - CREATE_FUNCTION
+      - CREATE_MATERIALIZED_VIEW
+      - CREATE_MODEL
+      - CREATE_SCHEMA
+      - CREATE_TABLE
+      - CREATE_VOLUME
+      - EXECUTE
+      - EXTERNAL_USE_SCHEMA
+      - MANAGE
+      - MODIFY
+      - READ_VOLUME
+      - REFRESH
+      - SELECT
+      - USE_CATALOG
+      - USE_SCHEMA
+      - WRITE_VOLUME
+    PrincipalPrivileges:
+      type: object
+      required:
+      - principal
+      - privileges
+      properties:
+        principal:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: E-mail (usuário), nome (grupo) ou applicationId (service principal).
+          examples:
+          - grp-analytics
+          - joao@empresa.com
+        privileges:
+          type: array
+          items:
+            $ref: '#/components/schemas/Privilege'
+    PrivilegeChange:
+      type: object
+      required:
+      - principal
+      - privileges
+      additionalProperties: false
+      properties:
+        principal:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: E-mail (usuário), nome (grupo) ou applicationId (service principal).
+          examples:
+          - grp-analytics
+          - joao@empresa.com
+        privileges:
+          type: array
+          minItems: 1
+          maxItems: 20
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Privilege'
+    GrantChangeRequest:
+      type: object
+      required:
+      - changes
+      additionalProperties: false
+      description: Mesmo corpo para grant e revoke; a ação é definida pela rota.
+      properties:
+        changes:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/PrivilegeChange'
+      examples:
+      - changes:
+        - principal: grp-analytics
+          privileges:
+          - USE_SCHEMA
+          - SELECT
+    ChangeOutcome:
+      type: object
+      required:
+      - principal
+      - applied
+      - unchanged
+      properties:
+        principal:
+          type: string
+        applied:
+          type: array
+          items:
+            $ref: '#/components/schemas/Privilege'
+          description: Privilégios efetivamente concedidos/revogados.
+        unchanged:
+          type: array
+          items:
+            $ref: '#/components/schemas/Privilege'
+          description: Já estavam no estado pedido (no-op).
+    GrantChangeResult:
+      type: object
+      required:
+      - securable
+      - outcomes
+      - grants
+      - changed
+      - audit_id
+      properties:
+        securable:
+          $ref: '#/components/schemas/SecurableRef'
+        outcomes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChangeOutcome'
+        grants:
+          type: array
+          items:
+            $ref: '#/components/schemas/PrincipalPrivileges'
+          description: Estado resultante dos grants diretos no objeto.
+        changed:
+          type: boolean
+          description: '`false` se tudo foi no-op.'
+        audit_id:
+          type: string
+      examples:
+      - securable:
+          type: SCHEMA
+          name: prod.vendas
+          metastore_id: a1b2c3
+        outcomes:
+        - principal: grp-analytics
+          applied:
+          - SELECT
+          unchanged:
+          - USE_SCHEMA
+        grants:
+        - principal: grp-analytics
+          privileges:
+          - USE_SCHEMA
+          - SELECT
+        changed: true
+        audit_id: evt_01J9ZQ
+    GrantList:
+      type: object
+      required:
+      - securable
+      - grants
+      properties:
+        securable:
+          $ref: '#/components/schemas/SecurableRef'
+        grants:
+          type: array
+          items:
+            $ref: '#/components/schemas/PrincipalPrivileges'
+        next_page_token:
+          type:
+          - string
+          - 'null'
+    EffectivePrivilege:
+      type: object
+      required:
+      - privilege
+      properties:
+        privilege:
+          $ref: '#/components/schemas/Privilege'
+        inherited_from_type:
+          anyOf:
+          - $ref: '#/components/schemas/SecurableType'
+          - type: 'null'
+        inherited_from_name:
+          type:
+          - string
+          - 'null'
+    EffectiveGrant:
+      type: object
+      required:
+      - principal
+      - privileges
+      properties:
+        principal:
+          type: string
+        privileges:
+          type: array
+          items:
+            $ref: '#/components/schemas/EffectivePrivilege'
+    EffectiveGrantList:
+      type: object
+      required:
+      - securable
+      - grants
+      properties:
+        securable:
+          $ref: '#/components/schemas/SecurableRef'
+        grants:
+          type: array
+          items:
+            $ref: '#/components/schemas/EffectiveGrant'
+        next_page_token:
+          type:
+          - string
+          - 'null'
+    Owner:
+      type: object
+      required:
+      - owner
+      properties:
+        owner:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: E-mail (usuário), nome (grupo) ou applicationId (service principal).
+          examples:
+          - grp-analytics
+          - joao@empresa.com
+    OwnerUpdate:
+      type: object
+      required:
+      - owner
+      additionalProperties: false
+      properties:
+        owner:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: E-mail (usuário), nome (grupo) ou applicationId (service principal).
+          examples:
+          - grp-analytics
+          - joao@empresa.com
+    TagValue:
+      type: object
+      required:
+      - value
+      additionalProperties: false
+      properties:
+        value:
+          type: string
+          maxLength: 1000
+    TagAssignment:
+      type: object
+      required:
+      - key
+      - value
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+    TagList:
+      type: object
+      required:
+      - tags
+      properties:
+        tags:
+          type: array
+          items:
+            $ref: '#/components/schemas/TagAssignment'
+        next_page_token:
+          type:
+          - string
+          - 'null'
+          description: Ausente/nulo quando não há mais páginas.
+    PrincipalType:
+      type: string
+      enum:
+      - USER
+      - GROUP
+      - SERVICE_PRINCIPAL
+    Principal:
+      type: object
+      required:
+      - name
+      - type
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+          description: Valor a usar em grant/revoke.
+        type:
+          $ref: '#/components/schemas/PrincipalType'
+        display_name:
+          type:
+          - string
+          - 'null'
+        active:
+          type: boolean
+    PrincipalList:
+      type: object
+      required:
+      - principals
+      properties:
+        principals:
+          type: array
+          items:
+            $ref: '#/components/schemas/Principal'
+        next_page_token:
+          type:
+          - string
+          - 'null'
+          description: Ausente/nulo quando não há mais páginas.
+    Workspace:
+      type: object
+      required:
+      - id
+      - display_name
+      - status
+      properties:
+        id:
+          type: string
+          description: Alias no registry (usado como `{ws}`).
+        display_name:
+          type: string
+        databricks_workspace_id:
+          type: string
+        cloud:
+          type: string
+          enum:
+          - AWS
+          - AZURE
+          - GCP
+        region:
+          type: string
+        metastore_id:
+          type: string
+        status:
+          type: string
+          enum:
+          - ACTIVE
+          - DISABLED
+    WorkspaceList:
+      type: object
+      required:
+      - workspaces
+      properties:
+        workspaces:
+          type: array
+          items:
+            $ref: '#/components/schemas/Workspace'
+        next_page_token:
+          type:
+          - string
+          - 'null'
+          description: Ausente/nulo quando não há mais páginas.
+    Catalog:
+      type: object
+      required:
+      - name
+      properties:
+        name:
+          type: string
+        comment:
+          type:
+          - string
+          - 'null'
+        owner:
+          type: string
+        storage_root:
+          type:
+          - string
+          - 'null'
+        properties:
+          type: object
+          additionalProperties:
+            type: string
+        metastore_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        created_by:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+        updated_by:
+          type: string
+    CatalogCreate:
+      type: object
+      required:
+      - name
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          pattern: ^[a-z][a-z0-9_]{0,254}$
+          description: Minúsculas, dígitos e `_`; começa com letra.
+        comment:
+          type: string
+          maxLength: 1024
+        storage_root:
+          type: string
+          description: URI de storage (opcional).
+        properties:
+          type: object
+          additionalProperties:
+            type: string
+    CatalogUpdate:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        comment:
+          type: string
+          maxLength: 1024
+        new_name:
+          type: string
+          pattern: ^[a-z][a-z0-9_]{0,254}$
+        properties:
+          type: object
+          additionalProperties:
+            type: string
+    CatalogList:
+      type: object
+      required:
+      - catalogs
+      properties:
+        catalogs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Catalog'
+        next_page_token:
+          type:
+          - string
+          - 'null'
+          description: Ausente/nulo quando não há mais páginas.
+    DataSchema:
+      type: object
+      required:
+      - name
+      - catalog_name
+      - full_name
+      properties:
+        name:
+          type: string
+        catalog_name:
+          type: string
+        full_name:
+          type: string
+        comment:
+          type:
+          - string
+          - 'null'
+        owner:
+          type: string
+        storage_root:
+          type:
+          - string
+          - 'null'
+        properties:
+          type: object
+          additionalProperties:
+            type: string
+        created_at:
+          type: string
+          format: date-time
+        created_by:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+        updated_by:
+          type: string
+    DataSchemaCreate:
+      type: object
+      required:
+      - name
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          pattern: ^[a-z][a-z0-9_]{0,254}$
+        comment:
+          type: string
+          maxLength: 1024
+        storage_root:
+          type: string
+        properties:
+          type: object
+          additionalProperties:
+            type: string
+    DataSchemaUpdate:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        comment:
+          type: string
+          maxLength: 1024
+        new_name:
+          type: string
+          pattern: ^[a-z][a-z0-9_]{0,254}$
+        properties:
+          type: object
+          additionalProperties:
+            type: string
+    DataSchemaList:
+      type: object
+      required:
+      - schemas
+      properties:
+        schemas:
+          type: array
+          items:
+            $ref: '#/components/schemas/DataSchema'
+        next_page_token:
+          type:
+          - string
+          - 'null'
+          description: Ausente/nulo quando não há mais páginas.
+    Column:
+      type: object
+      required:
+      - name
+      - type_text
+      - position
+      properties:
+        name:
+          type: string
+        type_text:
+          type: string
+          examples:
+          - decimal(10,2)
+        position:
+          type: integer
+        nullable:
+          type: boolean
+        comment:
+          type:
+          - string
+          - 'null'
+    Table:
+      type: object
+      required:
+      - name
+      - catalog_name
+      - schema_name
+      - full_name
+      description: Na listagem, `columns` é omitido; use o GET do item para obtê-las.
+      properties:
+        name:
+          type: string
+        catalog_name:
+          type: string
+        schema_name:
+          type: string
+        full_name:
+          type: string
+        table_type:
+          type: string
+          examples:
+          - MANAGED
+          - EXTERNAL
+        data_source_format:
+          type:
+          - string
+          - 'null'
+          examples:
+          - DELTA
+        storage_location:
+          type:
+          - string
+          - 'null'
+        comment:
+          type:
+          - string
+          - 'null'
+        owner:
+          type: string
+        columns:
+          type: array
+          items:
+            $ref: '#/components/schemas/Column'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    TableList:
+      type: object
+      required:
+      - tables
+      properties:
+        tables:
+          type: array
+          items:
+            $ref: '#/components/schemas/Table'
+        next_page_token:
+          type:
+          - string
+          - 'null'
+          description: Ausente/nulo quando não há mais páginas.
+    View:
+      type: object
+      required:
+      - name
+      - catalog_name
+      - schema_name
+      - full_name
+      properties:
+        name:
+          type: string
+        catalog_name:
+          type: string
+        schema_name:
+          type: string
+        full_name:
+          type: string
+        view_definition:
+          type:
+          - string
+          - 'null'
+        comment:
+          type:
+          - string
+          - 'null'
+        owner:
+          type: string
+        columns:
+          type: array
+          items:
+            $ref: '#/components/schemas/Column'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    ViewList:
+      type: object
+      required:
+      - views
+      properties:
+        views:
+          type: array
+          items:
+            $ref: '#/components/schemas/View'
+        next_page_token:
+          type:
+          - string
+          - 'null'
+          description: Ausente/nulo quando não há mais páginas.
+    Volume:
+      type: object
+      required:
+      - name
+      - catalog_name
+      - schema_name
+      - full_name
+      - volume_type
+      properties:
+        name:
+          type: string
+        catalog_name:
+          type: string
+        schema_name:
+          type: string
+        full_name:
+          type: string
+        volume_type:
+          type: string
+          enum:
+          - MANAGED
+          - EXTERNAL
+        storage_location:
+          type:
+          - string
+          - 'null'
+        comment:
+          type:
+          - string
+          - 'null'
+        owner:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    VolumeCreate:
+      type: object
+      required:
+      - name
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          pattern: ^[a-z][a-z0-9_]{0,254}$
+        volume_type:
+          type: string
+          enum:
+          - MANAGED
+          - EXTERNAL
+          default: MANAGED
+        storage_location:
+          type: string
+        comment:
+          type: string
+          maxLength: 1024
+      if:
+        properties:
+          volume_type:
+            const: EXTERNAL
+        required:
+        - volume_type
+      then:
+        required:
+        - storage_location
+    VolumeUpdate:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        comment:
+          type: string
+          maxLength: 1024
+        new_name:
+          type: string
+          pattern: ^[a-z][a-z0-9_]{0,254}$
+    VolumeList:
+      type: object
+      required:
+      - volumes
+      properties:
+        volumes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Volume'
+        next_page_token:
+          type:
+          - string
+          - 'null'
+          description: Ausente/nulo quando não há mais páginas.
+    AuditOutcome:
+      type: string
+      enum:
+      - SUCCESS
+      - FAILURE
+      - PARTIAL
+    AuditAction:
+      type: string
+      enum:
+      - GRANT
+      - REVOKE
+      - OWNER_SET
+      - TAG_SET
+      - TAG_DELETE
+      - CATALOG_CREATE
+      - CATALOG_UPDATE
+      - CATALOG_DELETE
+      - SCHEMA_CREATE
+      - SCHEMA_UPDATE
+      - SCHEMA_DELETE
+      - TABLE_DELETE
+      - VIEW_DELETE
+      - VOLUME_CREATE
+      - VOLUME_UPDATE
+      - VOLUME_DELETE
+    AuditEvent:
+      type: object
+      required:
+      - id
+      - occurred_at
+      - workspace
+      - actor
+      - action
+      - outcome
+      - change_ref
+      - request_id
+      properties:
+        id:
+          type: string
+        occurred_at:
+          type: string
+          format: date-time
+        workspace:
+          type: string
+        metastore_id:
+          type: string
+        actor:
+          type: string
+        action:
+          $ref: '#/components/schemas/AuditAction'
+        outcome:
+          $ref: '#/components/schemas/AuditOutcome'
+        securable:
+          anyOf:
+          - $ref: '#/components/schemas/SecurableRef'
+          - type: 'null'
+        targets:
+          type: array
+          items:
+            type: string
+          description: Principals afetados (grant/revoke/owner).
+        change_ref:
+          type: string
+        request_id:
+          type: string
+        before:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+        after:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+        error:
+          anyOf:
+          - type: 'null'
+          - type: object
+            properties:
+              type:
+                type: string
+              detail:
+                type: string
+    AuditEventList:
+      type: object
+      required:
+      - events
+      properties:
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEvent'
+        next_page_token:
+          type:
+          - string
+          - 'null'
+          description: Ausente/nulo quando não há mais páginas.
